@@ -1829,7 +1829,7 @@ RunService.Heartbeat:Connect(function()
 		lastAutoSave = lastAutoSave + speed
 		local profile = autoSaveList[autoSaveIndex]
 
-		if profile and (now - profile._loadTimestamp) < C.SAVE_INTERVAL / 2 then
+		if profile and (now - (profile._loadTimestamp or now)) < C.SAVE_INTERVAL / 2 then
 			profile = nil
 			for _ = 1, listLen - 1 do
 				autoSaveIndex = autoSaveIndex + 1
@@ -1837,7 +1837,7 @@ RunService.Heartbeat:Connect(function()
 					autoSaveIndex = 1
 				end
 				local c = autoSaveList[autoSaveIndex]
-				if c and (now - c._loadTimestamp) >= C.SAVE_INTERVAL / 2 then
+				if c and (now - (c._loadTimestamp or now)) >= C.SAVE_INTERVAL / 2 then
 					profile = c
 					break
 				end
@@ -1850,7 +1850,7 @@ RunService.Heartbeat:Connect(function()
 		end
 
 		if profile and profile:IsActive() and profile._pendingSaves == 0 then
-			local shouldForcedPing = (now - profile._lastSaveTime) > (C.ASSUME_DEAD * 0.5)
+			local shouldForcedPing = (now - (profile._lastSaveTime or now)) > (C.ASSUME_DEAD * 0.5)
 			if profile._isDirty or shouldForcedPing then
 				task.spawn(function()
 					profile:Save():catch(function(_) end)
