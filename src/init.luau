@@ -100,6 +100,7 @@ export type StoreConfig = {
 	DataStoreName: string,
 	Scope: string?,
 	UseMock: boolean?,
+	UseArrayCompression: boolean?,
 }
 
 export type GlobalUpdate = {
@@ -366,6 +367,71 @@ local function ValidateSchema(target: any, schema: any): boolean
 		end
 	end
 	return true
+end
+
+local function CompressData(data: any): any
+	if typ(data) ~= "table" then
+		return data
+	end
+
+	local keys = {}
+	local keyMap = {}
+
+	local function getKeyIndex(k: string)
+		if not keyMap[k] then
+			t_insert(keys, k)
+			keyMap[k] = "~" .. tostr(#keys)
+		end
+		return keyMap[k]
+	end
+
+	local function process(val: any): any
+		if typ(val) == "table" then
+			local newTbl = {}
+			for k, v in val do
+				if typ(k) == "string" then
+					newTbl[getKeyIndex(k)] = process(v)
+				else
+					newTbl[k] = process(v)
+				end
+			end
+			return newTbl
+		end
+		return val
+	end
+
+	local compressed = process(data)
+	return { _C = true, K = keys, D = compressed }
+end
+
+local function DecompressData(data: any): any
+	if typ(data) == "table" and data._C == true and data.K and data.D then
+		local keys = data.K
+		local compressed = data.D
+
+		local function process(val: any): any
+			if typ(val) == "table" then
+				local newTbl = {}
+				for k, v in val do
+					if typ(k) == "string" and s_find(k, "^~") then
+						local idx = tonumber(string.sub(k, 2))
+						if idx and keys[idx] then
+							newTbl[keys[idx]] = process(v)
+						else
+							newTbl[k] = process(v)
+						end
+					else
+						newTbl[k] = process(v)
+					end
+				end
+				return newTbl
+			end
+			return val
+		end
+
+		return process(compressed)
+	end
+	return data
 end
 
 local function GenerateId(): string
@@ -750,6 +816,7 @@ function ProfileClass:_SaveInternal(isReleasing: boolean, forceOverride: boolean
 
 	local cleanData = StripProxyAndCopy(self.Data)
 	local dataToSave = self:_RunMiddlewares("PreSave", cleanData)
+	local dataToSaveToDatastore = self.Store._config.UseArrayCompression and CompressData(dataToSave) or dataToSave
 
 	local myJobId = JOB_ID
 	local myPlaceId = PLACE_ID
@@ -808,7 +875,7 @@ function ProfileClass:_SaveInternal(isReleasing: boolean, forceOverride: boolean
 			local vId = existing and (existing.VersionId + 1) or 1
 
 			mockRef[self.Key] = {
-				Data = StripProxyAndCopy(dataToSave),
+				Data = StripProxyAndCopy(dataToSaveToDatastore),
 				MetaData = StripProxyAndCopy(myMeta),
 				RobloxMetaData = StripProxyAndCopy(self.RobloxMetaData),
 				CreatedTime = cTime,
@@ -881,7 +948,7 @@ function ProfileClass:_SaveInternal(isReleasing: boolean, forceOverride: boolean
 			myMeta.GlobalUpdates[1] = m_max(myMeta.GlobalUpdates[1], extIndex)
 			myMeta.GlobalUpdates[2] = mergedUpdates
 
-			latest.Data = dataToSave
+			latest.Data = dataToSaveToDatastore
 			latest.MetaData = myMeta
 
 			return latest, myUserIds, self.RobloxMetaData
@@ -917,7 +984,7 @@ function ProfileClass:_SaveInternal(isReleasing: boolean, forceOverride: boolean
 			task.spawn(function()
 				pcall(function()
 					self.Store._backupStore:SetAsync(self.Key, {
-						Data = dataToSave,
+						Data = dataToSaveToDatastore,
 						MetaData = myMeta,
 						BackupTimestamp = o_time(),
 					})
@@ -1430,7 +1497,7 @@ function StoreClass:LoadProfileAsync(key: string, forceLoad: boolean?, cancelFn:
 				end
 
 				if not self._dataStore then
-					error("DATASTORE_UNAVAILABLE")
+				error("DATASTORE_UNAVAILABLE")
 				end
 
 				local claimed = false
@@ -1438,72 +1505,82 @@ function StoreClass:LoadProfileAsync(key: string, forceLoad: boolean?, cancelFn:
 				local lockedSession = nil
 
 				local loadedData, loadedKeyInfo = self._dataStore:UpdateAsync(key, function(existing: any): any
-					if not existing then
-						local meta = self:_createDefaultMetaData()
-						meta.SessionLoadCount = 1
-						meta.ActiveSession = { JobId = JOB_ID, PlaceId = PLACE_ID, SessionId = sessionId }
-						meta.LastUpdateTime = o_time()
-						claimed = true
-						return { Data = StripProxyAndCopy(self.Template), MetaData = meta }
+				if not existing then
+					local meta = self:_createDefaultMetaData()
+					meta.SessionLoadCount = 1
+					meta.ActiveSession = { JobId = JOB_ID, PlaceId = PLACE_ID, SessionId = sessionId }
+					meta.LastUpdateTime = o_time()
+					claimed = true
+					local initData = StripProxyAndCopy(self.Template)
+					if self.Store and self.Store._config.UseArrayCompression then
+						initData = CompressData(initData)
 					end
+					return { Data = initData, MetaData = meta }
+				end
 
-					if not ValidateSchema(existing.Data, self.Template) then
-						ReconcileTable(existing.Data, self.Template)
-						RegisterOverwrite(self.Name, key)
+				local uncompressedData = DecompressData(existing.Data)
+				if not ValidateSchema(uncompressedData, self.Template) then
+					ReconcileTable(uncompressedData, self.Template)
+					if self.Store and self.Store._config.UseArrayCompression then
+						existing.Data = CompressData(uncompressedData)
+					else
+						existing.Data = uncompressedData
 					end
+					RegisterOverwrite(self.Name, key)
+				end
 
-					local sess = existing.MetaData.ActiveSession
-					if not sess then
-						existing.MetaData.ActiveSession = { JobId = JOB_ID, PlaceId = PLACE_ID, SessionId = sessionId }
-						existing.MetaData.ForceLoadSession = nil
-						existing.MetaData.SessionLoadCount = existing.MetaData.SessionLoadCount + 1
-						existing.MetaData.LastUpdateTime = o_time()
-						claimed = true
-						return existing
-					end
-
-					if sess.JobId == JOB_ID and sess.PlaceId == PLACE_ID then
-						existing.MetaData.LastUpdateTime = o_time()
-						claimed = true
-						return existing
-					end
-
-					local age = o_time() - (existing.MetaData.LastUpdateTime or 0)
-					if age > C.ASSUME_DEAD then
-						existing.MetaData.ActiveSession = { JobId = JOB_ID, PlaceId = PLACE_ID, SessionId = sessionId }
-						existing.MetaData.ForceLoadSession = nil
-						existing.MetaData.SessionLoadCount = existing.MetaData.SessionLoadCount + 1
-						existing.MetaData.LastUpdateTime = o_time()
-						claimed = true
-						return existing
-					end
-
-					if stealSession then
-						local fs = existing.MetaData.ForceLoadSession
-						local myForce = fs and fs.JobId == JOB_ID and fs.PlaceId == PLACE_ID
-						if myForce or forceLoad then
-							existing.MetaData.ActiveSession =
-								{ JobId = JOB_ID, PlaceId = PLACE_ID, SessionId = sessionId }
-							existing.MetaData.ForceLoadSession = nil
-							existing.MetaData.SessionLoadCount = existing.MetaData.SessionLoadCount + 1
-							existing.MetaData.LastUpdateTime = o_time()
-							claimed = true
-							return existing
-						end
-					end
-
-					lockedByOther = true
-					lockedSession = existing.MetaData.ActiveSession
-					if forceLoad and requestForceLoad then
-						existing.MetaData.ForceLoadSession = { JobId = JOB_ID, PlaceId = PLACE_ID }
-					end
+				local sess = existing.MetaData.ActiveSession
+				if not sess then
+					existing.MetaData.ActiveSession = { JobId = JOB_ID, PlaceId = PLACE_ID, SessionId = sessionId }
+					existing.MetaData.ForceLoadSession = nil
+					existing.MetaData.SessionLoadCount = existing.MetaData.SessionLoadCount + 1
+					existing.MetaData.LastUpdateTime = o_time()
+					claimed = true
 					return existing
+				end
+
+				if sess.JobId == JOB_ID and sess.PlaceId == PLACE_ID then
+					existing.MetaData.LastUpdateTime = o_time()
+					claimed = true
+					return existing
+				end
+
+				local age = o_time() - (existing.MetaData.LastUpdateTime or 0)
+				if age > C.ASSUME_DEAD then
+					existing.MetaData.ActiveSession = { JobId = JOB_ID, PlaceId = PLACE_ID, SessionId = sessionId }
+					existing.MetaData.ForceLoadSession = nil
+					existing.MetaData.SessionLoadCount = existing.MetaData.SessionLoadCount + 1
+					existing.MetaData.LastUpdateTime = o_time()
+					claimed = true
+					return existing
+				end
+
+				if stealSession then
+					local fs = existing.MetaData.ForceLoadSession
+					local myForce = fs and fs.JobId == JOB_ID and fs.PlaceId == PLACE_ID
+					if myForce or forceLoad then
+						existing.MetaData.ActiveSession =
+							{ JobId = JOB_ID, PlaceId = PLACE_ID, SessionId = sessionId }
+						existing.MetaData.ForceLoadSession = nil
+						existing.MetaData.SessionLoadCount = existing.MetaData.SessionLoadCount + 1
+						existing.MetaData.LastUpdateTime = o_time()
+						claimed = true
+						return existing
+					end
+				end
+
+				lockedByOther = true
+				lockedSession = existing.MetaData.ActiveSession
+				if forceLoad and requestForceLoad then
+					existing.MetaData.ForceLoadSession = { JobId = JOB_ID, PlaceId = PLACE_ID }
+				end
+				return existing
 				end)
 
 				if claimed then
-					loadedData.Data, loadedData.MetaData.Version =
-						self:_runMigrations(loadedData.Data, loadedData.MetaData.Version or 0)
-
+				loadedData.Data = DecompressData(loadedData.Data)
+				loadedData.Data, loadedData.MetaData.Version =
+					self:_runMigrations(loadedData.Data, loadedData.MetaData.Version or 0)
 					local profile = ProfileClass.new(
 						key,
 						loadedData.Data,
